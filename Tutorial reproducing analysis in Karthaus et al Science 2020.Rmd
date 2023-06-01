@@ -1,0 +1,765 @@
+---
+title: "Reproducing analysis of Karthaus et al Science 2020"
+author: "Lian Chee Foong"
+date: "2023-05-07"
+output: html_document
+---
+
+#### Load Karthaus raw count data ####
+
+```{r}
+
+# Load libraries
+library(Seurat)
+library(tidyverse)
+library(stringr)
+library(rliger)
+library(SeuratWrappers)
+
+# load Karthaus CSawyers
+CSawyer <- Read10X_h5("E:/R_paper_Karthaus_CSawyer_Sci2020_mouse_castrated_scRNA/Data/GSE146811_mmProstate10x_timecourse_rawCount.h5")
+GSE146811_mmProstate10x_full_sample_final_tsv <- read_tsv("E:/R_paper_Karthaus_CSawyer_Sci2020_mouse_castrated_scRNA/Data/GSE146811_mmProstate10x_full_sample_final.tsv.gz",
+                                                          trim_ws = TRUE)
+GSE146811_mmProstate10x_full_sample_final_tsv <- data.frame(GSE146811_mmProstate10x_full_sample_final_tsv)
+rownames(GSE146811_mmProstate10x_full_sample_final_tsv) <- GSE146811_mmProstate10x_full_sample_final_tsv$sampleID
+CSawyer <- CreateSeuratObject(counts = CSawyer,
+                              meta.data = GSE146811_mmProstate10x_full_sample_final_tsv)
+table(CSawyer$orig.ident)
+table(CSawyer$batchID)
+
+# add sampleInfo in metadata
+metadata <- CSawyer@meta.data
+metadata$sampleType <- ifelse(metadata$orig.ident == "T00", "Intact",
+                              ifelse(metadata$orig.ident %in% c("T01", "T02", "T03", "T04"),
+                                     "Cast", "Regen"))
+metadata$sampleInfo <- str_sub(metadata$batchID, 0, -3)
+CSawyer@meta.data <- metadata
+rm(GSE146811_mmProstate10x_full_sample_final_tsv, metadata)
+table(CSawyer$predType)
+table(CSawyer$highLevelPred)
+```
+
+#### 1. Clustering using LIGER for NMF and graph-based approach (for CSawyer_intact)  ####
+
+```{r}
+
+# Subset Intact samples only 
+Idents(CSawyer) <- CSawyer$batchID
+CSawyer_intact <- subset(CSawyer, idents = c("T00_intact_1",  "T00_intact_2" ) , invert = F)
+
+CSawyer_intact
+table(CSawyer_intact$orig.ident)
+table(CSawyer_intact$batchID)
+
+# Compute percent mito ratio
+CSawyer_intact$mitoRatio <- PercentageFeatureSet(object = CSawyer_intact, pattern = "^mt-")
+CSawyer_intact$mitoRatio <- CSawyer_intact@meta.data$mitoRatio / 100
+
+
+# filter
+filtered_CSawyer_intact <- subset(
+  x = CSawyer_intact,
+  subset =  nFeature_RNA > 500 &
+    nCount_RNA > 1000 &
+    mitoRatio < 0.15)
+
+filtered_CSawyer_intact <- NormalizeData(filtered_CSawyer_intact, normalization.method = "LogNormalize", scale.factor = 10000)
+filtered_CSawyer_intact <- FindVariableFeatures(filtered_CSawyer_intact, selection.method = "vst", nfeatures = 2000, verbose = T)
+filtered_CSawyer_intact <- ScaleData(filtered_CSawyer_intact, split.by = "orig.ident", do.center = FALSE)
+filtered_CSawyer_intact <- RunOptimizeALS(filtered_CSawyer_intact, k = 20, lambda = 5, split.by = "orig.ident")
+filtered_CSawyer_intact <- RunQuantileNorm(filtered_CSawyer_intact, split.by = "orig.ident")
+filtered_CSawyer_intact <- FindNeighbors(filtered_CSawyer_intact, reduction = "iNMF_raw", dims = 1:20)
+filtered_CSawyer_intact <- FindClusters(filtered_CSawyer_intact, resolution = c(0.5, 0.8,1,3))
+filtered_CSawyer_intact <- RunUMAP(filtered_CSawyer_intact, dims = 1:ncol(filtered_CSawyer_intact[["iNMF_raw"]]), reduction = "iNMF_raw")
+Idents(filtered_CSawyer_intact) <- filtered_CSawyer_intact$RNA_snn_res.0.5
+DimPlot(filtered_CSawyer_intact, split.by = "orig.ident", label = F)
+
+cols <- rev(rainbow(7)[-7])
+gene <- c("Krt5","Krt14","Trp63","Krt8","Krt18","Cd24a")
+for (j in 1:length(gene)){
+  p <- FeaturePlot(filtered_CSawyer_intact, features = gene[j], split.by = "orig.ident", cols = cols)
+  assign(paste0("UMAP_", gene[j]), p)
+}
+gene <- c("Epcam","Pax2","Pate4","Calml3","Ptprc", "Cdh1")
+for (j in 1:length(gene)){
+  p <- FeaturePlot(filtered_CSawyer_intact, features = gene[j],split.by = "orig.ident", cols = cols) 
+  assign(paste0("UMAP_", gene[j]), p)
+}
+p1 <- plot_grid(UMAP_Epcam, UMAP_Cdh1,  UMAP_Ptprc,ncol = 1 )
+p2 <- plot_grid(UMAP_Trp63, UMAP_Krt5, UMAP_Krt14,  ncol = 1)
+p3 <- plot_grid(UMAP_Cd24a, UMAP_Krt8, UMAP_Krt18,  ncol = 1)
+p4 <- plot_grid(UMAP_Pax2, UMAP_Pate4, UMAP_Calml3, ncol = 1)
+plot_grid(p1,p4, ncol = 2)
+plot_grid(p2, p3,  ncol = 2)
+```
+
+```{r}
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#### classify high-level cell types (epithelial, immune, stromal) ####
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+Idents(filtered_CSawyer_intact) <- filtered_CSawyer_intact$RNA_snn_res.0.5
+AvgExpr <- AverageExpression(filtered_CSawyer_intact, features = c("Epcam","Ptprc"))
+AvgExpr <- AvgExpr[[1]]
+AvgExpr <- as.data.frame(AvgExpr)
+AvgExpr <- t(AvgExpr)
+
+Idents(filtered_CSawyer_intact) <- "RNA_snn_res.0.5"
+filtered_CSawyer_intact <-  RenameIdents(object = filtered_CSawyer_intact,
+                                         "0" = "Epithelial",
+                                         "1" = "Epithelial",
+                                         "2" = "Stromal",
+                                         "3" = "Epithelial",
+                                         "4" = "Epithelial",
+                                         "5" = "Stromal",
+                                         "6" = "Stromal",
+                                         "7" = "Stromal",
+                                         "8" = "Epithelial",
+                                         "9" = "Immune",
+                                         "10" = "Epithelial",
+                                         "11" = "Immune",
+                                         "12" = "Epithelial",
+                                         "13" = "Immune",
+                                         "14" = "Immune",
+                                         "15" = "Epithelial",
+                                         "16" = "Immune",
+                                         "17" = "Epithelial",
+                                         "18" = "Stromal",
+                                         "19" = "Epithelial",
+                                         "20" = "Stromal",
+                                         "21" = "Stromal"
+)
+filtered_CSawyer_intact$highlevelCelltype <- Idents(filtered_CSawyer_intact)
+filtered_CSawyer_intact$highLevelPred <- factor(filtered_CSawyer_intact$highLevelPred, levels = c("Epi","Str","Imm"))
+p1 <- DimPlot(filtered_CSawyer_intact, group.by = "highlevelCelltype", label = F)
+p2 <- DimPlot(filtered_CSawyer_intact, group.by = "highLevelPred", label = F)
+plot_grid(p1,p2, ncol = 2)
+
+# save(filtered_CSawyer_intact, file = "filtered_CSawyer_intact_notbeingsubset.RData")
+
+```
+
+#### 2a. Subset to Epithelial cells only (filtered_CSawyer_intact) ####
+
+```{r}
+
+Idents(filtered_CSawyer_intact) <- filtered_CSawyer_intact$highlevelCelltype
+filtered_CSawyer_intact_Epi <- subset(filtered_CSawyer_intact, idents = "Epithelial")
+filtered_CSawyer_intact_Epi <- CreateSeuratObject(counts = filtered_CSawyer_intact_Epi@assays$RNA@counts,
+                                                  meta.data = filtered_CSawyer_intact_Epi@meta.data %>% 
+                                                    select(batchID,highLevelPred,highLevelPredAmbig,predType, predTypeAmbig,sampleInfo,highlevelCelltype))
+
+filtered_CSawyer_intact_Epi <- NormalizeData(filtered_CSawyer_intact_Epi, normalization.method = "LogNormalize", scale.factor = 10000)
+filtered_CSawyer_intact_Epi <- FindVariableFeatures(filtered_CSawyer_intact_Epi, selection.method = "vst", nfeatures = 2000, verbose = T)
+filtered_CSawyer_intact_Epi <- ScaleData(filtered_CSawyer_intact_Epi,  do.center = FALSE)
+filtered_CSawyer_intact_Epi <- RunOptimizeALS(filtered_CSawyer_intact_Epi, k = 21, lambda = 5)
+filtered_CSawyer_intact_Epi <- RunQuantileNorm(filtered_CSawyer_intact_Epi)
+filtered_CSawyer_intact_Epi <- FindNeighbors(filtered_CSawyer_intact_Epi, reduction = "iNMF_raw", dims = 1:20)
+filtered_CSawyer_intact_Epi <- FindClusters(filtered_CSawyer_intact_Epi, resolution = c(0.5, 0.8,1,3,5))
+filtered_CSawyer_intact_Epi <- RunUMAP(filtered_CSawyer_intact_Epi, dims = 1:ncol(filtered_CSawyer_intact_Epi[["iNMF_raw"]]), reduction = "iNMF_raw")
+Idents(filtered_CSawyer_intact_Epi) <- filtered_CSawyer_intact_Epi$RNA_snn_res.0.5
+
+
+# Check cell type
+# refer to Karthaus et al. Science 2020 (CSawyers) mouse clustering
+# basal, Epcam, Krt5, Krt14 Trp63;
+# seminal vesicle basal, Epcam, Pax2, Krt5, Krt14 Trp63, Calml3;
+# luminal 1, Epcam, CD24a, Krt8, Krt18, Nkx3.1, Pbsn high;
+# luminal 2, Epcam, CD24a, Krt8, Krt18, Psca, Krt4, Tacst2,Ly6a;
+# luminal 3 (ionocyte), Epcam, CD24a, Krt8, Krt18, Foxi1, Atp6v1g3, Atp6b1b;
+# seminal vesicle luminal, Epcam, Pax2, Krt8, Krt18, Pate4;
+# seminal vesicle ionocyte, Epcam, Pax2, Foxi1.
+
+gene_epi <- c("Epcam", "Krt5", "Krt14", "Trp63", "Calml3",
+              "Cd24a", "Krt8", "Krt18", "Nkx3-1", "Pbsn",
+              "Psca", "Krt4", "Tacstd2","Ly6a",
+              "Foxi1", "Atp6v1g3", "Atp6v1b1", 
+              "Pax2","Pate4")
+Idents(filtered_CSawyer_intact_Epi) <- filtered_CSawyer_intact_Epi$RNA_snn_res.0.5
+AvgExpr <- AverageExpression(filtered_CSawyer_intact_Epi, features = gene_epi)
+AvgExpr <- AvgExpr[[1]]
+AvgExpr <- as.data.frame(AvgExpr)
+AvgExpr <- t(AvgExpr)
+AvgExpr <- round(AvgExpr, 3)
+
+Idents(filtered_CSawyer_intact_Epi) <- filtered_CSawyer_intact_Epi$RNA_snn_res.0.5
+VlnPlot(filtered_CSawyer_intact_Epi, features = gene_epi, stack = T, flip = T)
+
+Idents(filtered_CSawyer_intact_Epi) <- "RNA_snn_res.0.5"
+filtered_CSawyer_intact_Epi <-  RenameIdents(object = filtered_CSawyer_intact_Epi,
+                                             "0" = "Basal",
+                                             "1" = "Luminal 1",
+                                             "2" = "Basal",
+                                             "3" = "Basal",
+                                             "4" = "Luminal 1",
+                                             "5" = "Luminal 1",
+                                             "6" = "Basal",
+                                             "7" = "Seminal vesicle luminal",
+                                             "8" = "Basal",
+                                             "9" = "Seminal vesicle luminal",
+                                             "10" = "Luminal 3",
+                                             "11" = "Luminal 2",
+                                             "12" = "Basal",
+                                             "13" = "Luminal 1",
+                                             "14" = "Luminal 1",
+                                             "15" = "Luminal 3"
+)
+filtered_CSawyer_intact_Epi$luminal_celltype <- Idents(filtered_CSawyer_intact_Epi)
+p1 <- DimPlot(filtered_CSawyer_intact_Epi, group.by = "luminal_celltype")
+p2 <- DimPlot(filtered_CSawyer_intact_Epi, group.by = "RNA_snn_res.0.5")
+plot_grid(p1, p2, ncol = 2)
+# save(filtered_CSawyer_intact_Epi, file = "filtered_CSawyer_intact_Epi_XGBoost.RData")
+```
+
+#### xgboost for Intact CSawyers (included basal) ####
+
+```{r}
+#install.packages("xgboost")
+library(xgboost)
+library(tidymodels)
+
+####  train using basal and Luminal subtypes and SV luminal #### 
+set.seed(123)
+data<- filtered_CSawyer_intact_Epi@assays$RNA@scale.data
+data<- data[rownames(data) %in% c(gene_epi),]
+data<- t(data) %>% as.data.frame()
+data$cell_type <- filtered_CSawyer_intact_Epi$luminal_celltype
+data$cell_type<- factor(data$cell_type)
+data$cell_barcode<- rownames(data)
+
+data_split <- initial_split(data, strata = "cell_type")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# 10 fold cross validation
+data_fold <- vfold_cv(data_train, v = 10)
+
+# Define the recipe for pre-processing the data
+bt_recipe <- 
+  recipe(formula = cell_type ~ ., data = data_train) %>%
+  update_role(cell_barcode, new_role = "ID") %>%
+  step_zv(all_predictors())
+
+## Define the model specification and tune hyperparameters
+## feature importance sore to TRUE, tune mtry and number of trees
+bt_spec <- 
+  boost_tree(mtry = tune(), trees = tune()) %>%
+  set_engine("xgboost", importance = TRUE) %>%
+  set_mode("classification")
+
+bt_workflow <- workflow() %>% 
+  add_recipe(bt_recipe) %>% 
+  add_model(bt_spec)
+
+bt_grid<- grid_regular(mtry(range= c(1, 2000)), trees(), 
+                       levels = 3)
+
+library(doParallel)
+library(recipes)
+doParallel::registerDoParallel()
+
+# # save_pred = TRUE for later ROC curve
+tune_res <- tune_grid(
+  bt_workflow,
+  resamples = data_fold, 
+  grid = bt_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+# check which penalty is the best 
+autoplot(tune_res)
+best_penalty <- select_best(tune_res, metric = "accuracy")
+best_penalty
+
+# Fit the model on the training data and evaluate performance on the testing data
+bt_final <- finalize_workflow(bt_workflow, best_penalty)
+bt_final_fit_Epi <- fit(bt_final, data = data_train)
+
+# confusion matrix, perfect classification! 
+predict(bt_final_fit_Epi, new_data = data_test) %>%
+  bind_cols(data_test %>% select(cell_type)) %>%
+  conf_mat(truth = cell_type, estimate = .pred_class)
+
+# save(bt_final_fit_Epi, file = "RData/XGBoost_CSawyer_T00int_Epi_withbasalsubsets.RData")
+```
+
+#### 2b. Subset to Immune only (filtered_CSawyer_intact) ####
+
+```{r}
+
+Idents(filtered_CSawyer_intact) <- filtered_CSawyer_intact$highlevelCelltype
+filtered_CSawyer_intact_Imm <- subset(filtered_CSawyer_intact, idents = "Immune")
+filtered_CSawyer_intact_Imm <- CreateSeuratObject(counts = filtered_CSawyer_intact_Imm@assays$RNA@counts,
+                                                  meta.data = filtered_CSawyer_intact_Imm@meta.data %>% 
+                                                    select(batchID,highLevelPred,highLevelPredAmbig,predType, predTypeAmbig,sampleInfo,highlevelCelltype))
+
+filtered_CSawyer_intact_Imm <- NormalizeData(filtered_CSawyer_intact_Imm, normalization.method = "LogNormalize", scale.factor = 10000)
+filtered_CSawyer_intact_Imm <- FindVariableFeatures(filtered_CSawyer_intact_Imm, selection.method = "vst", nfeatures = 2000, verbose = T)
+filtered_CSawyer_intact_Imm <- ScaleData(filtered_CSawyer_intact_Imm,  do.center = FALSE)
+filtered_CSawyer_intact_Imm <- RunOptimizeALS(filtered_CSawyer_intact_Imm, k = 21, lambda = 5)
+filtered_CSawyer_intact_Imm <- RunQuantileNorm(filtered_CSawyer_intact_Imm)
+filtered_CSawyer_intact_Imm <- FindNeighbors(filtered_CSawyer_intact_Imm, reduction = "iNMF_raw", dims = 1:20)
+filtered_CSawyer_intact_Imm <- FindClusters(filtered_CSawyer_intact_Imm, resolution = c(0.5, 0.8,1,3,5))
+filtered_CSawyer_intact_Imm <- RunUMAP(filtered_CSawyer_intact_Imm, dims = 1:ncol(filtered_CSawyer_intact_Imm[["iNMF_raw"]]), reduction = "iNMF_raw")
+Idents(filtered_CSawyer_intact_Imm) <- filtered_CSawyer_intact_Imm$RNA_snn_res.0.5
+
+DimPlot(filtered_CSawyer_intact_Imm, group.by = "RNA_snn_res.0.5", label = T)
+
+# Check cell type
+# refer to Karthaus et al. Science 2020 (CSawyers) mouse clustering
+# B-cells, CD19, Ms4a1: 
+# T-cells, CD3, CD4, CD8;
+# macrophages, CD14, Aif1;
+
+gene_immune <- c("Cd19","Ms4a1", 
+                 "Cd3e","Cd3d","Cd3g","Cd3eap","Cd4","Cd8a","Cd8b1",
+                 "Cd14","Aif1","Aif1l",
+                 "Xcr1")
+Idents(filtered_CSawyer_intact_Imm) <- filtered_CSawyer_intact_Imm$RNA_snn_res.3
+AvgExpr <- AverageExpression(filtered_CSawyer_intact_Imm, features = gene_immune)
+AvgExpr <- AvgExpr[[1]]
+AvgExpr <- as.data.frame(AvgExpr)
+AvgExpr <- t(AvgExpr)
+AvgExpr <- round(AvgExpr, 3)
+
+Idents(filtered_CSawyer_intact_Imm) <- filtered_CSawyer_intact_Imm$RNA_snn_res.3
+VlnPlot(filtered_CSawyer_intact_Imm, features = gene_immune, stack = T, flip = T)
+
+Idents(filtered_CSawyer_intact_Imm) <- "RNA_snn_res.3"
+filtered_CSawyer_intact_Imm <-  RenameIdents(object = filtered_CSawyer_intact_Imm,
+                                             "0" = "Macrophage",
+                                             "1" = "T cell",
+                                             "2" = "Macrophage",
+                                             "3" = "Macrophage",
+                                             "4" = "Macrophage",
+                                             "5" = "Macrophage",
+                                             "6" = "T cell",
+                                             "7" = "Macrophage",
+                                             "8" = "Macrophage",
+                                             "9" = "Macrophage",
+                                             "10" = "Macrophage",
+                                             "11" = "Macrophage",
+                                             "12" = "Macrophage",
+                                             "13" = "Macrophage",
+                                             "14" = "Dendritic cell",
+                                             "15" = "B cell",
+                                             "16" = "T cell",
+                                             "17" = "Macrophage",
+                                             "18" = "Macrophage",
+                                             "19" = "Macrophage",
+                                             "20" = "Macrophage",
+                                             "21" = "Macrophage",
+                                             "22" = "Macrophage"
+)
+filtered_CSawyer_intact_Imm$Immune_celltype <- Idents(filtered_CSawyer_intact_Imm)
+p1 <- DimPlot(filtered_CSawyer_intact_Imm, group.by = "RNA_snn_res.3", label = T)
+p2 <-DimPlot(filtered_CSawyer_intact_Imm, group.by = "Immune_celltype")
+p3 <-DimPlot(filtered_CSawyer_intact_Imm, group.by = "predType")
+plot_grid(p1, p2, p3, ncol = 2)
+
+# save(filtered_CSawyer_intact_Imm, file = "RData/filtered_CSawyer_intact_Imm_XGBoost.RData")
+```
+
+#### xgboost for Intact CSawyers (immune only) ####
+
+```{r}
+#install.packages("xgboost")
+library(xgboost)
+library(tidymodels)
+
+set.seed(123)
+data<- filtered_CSawyer_intact_Imm@assays$RNA@scale.data
+data<- data[rownames(data) %in% gene_immune,]
+data<- t(data) %>% as.data.frame()
+data$cell_type <- filtered_CSawyer_intact_Imm$Immune_celltype
+data$cell_type<- factor(data$cell_type)
+data$cell_barcode<- rownames(data)
+
+data_split <- initial_split(data, strata = "cell_type")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# 10 fold cross validation
+data_fold <- vfold_cv(data_train, v = 10)
+
+bt_recipe <- 
+  recipe(formula = cell_type ~ ., data = data_train) %>%
+  update_role(cell_barcode, new_role = "ID") %>%
+  step_zv(all_predictors())
+
+## feature importance sore to TRUE, tune mtry and number of trees
+bt_spec <- 
+  boost_tree(mtry = tune(), trees = tune()) %>%
+  set_engine("xgboost", importance = TRUE) %>%
+  set_mode("classification")
+
+bt_workflow <- workflow() %>% 
+  add_recipe(bt_recipe) %>% 
+  add_model(bt_spec)
+
+bt_grid<- grid_regular(mtry(range= c(1,20)), trees(), levels = 3)
+
+# library(doParallel)
+# doParallel::registerDoParallel()
+
+# # save_pred = TRUE for later ROC curve
+tune_res <- tune_grid(
+  bt_workflow,
+  resamples = data_fold, 
+  grid = bt_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+# check which penalty is the best 
+autoplot(tune_res)
+best_penalty <- select_best(tune_res, metric = "accuracy")
+best_penalty
+
+bt_final <- finalize_workflow(bt_workflow, best_penalty)
+bt_final_fit_Imm <- fit(bt_final, data = data_train)
+
+## confusion matrix, perfect classification! 
+predict(bt_final_fit_Imm, new_data = data_test) %>%
+  bind_cols(data_test %>% select(cell_type)) %>%
+  conf_mat(truth = cell_type, estimate = .pred_class)
+
+# save(bt_final_fit_Imm, file = "RData/XGBoost_CSawyer_T00int_Immune.RData")
+```
+
+#### 2c. Subset to Stromal only (filtered_CSawyer_intact) ####
+
+```{r}
+
+Idents(filtered_CSawyer_intact) <- filtered_CSawyer_intact$highlevelCelltype
+filtered_CSawyer_intact_Str <- subset(filtered_CSawyer_intact, idents = "Stromal")
+filtered_CSawyer_intact_Str <- CreateSeuratObject(counts = filtered_CSawyer_intact_Str@assays$RNA@counts,
+                                                  meta.data = filtered_CSawyer_intact_Str@meta.data %>% select(batchID,highLevelPred,highLevelPredAmbig,predType, predTypeAmbig,
+                                                                                                               sampleInfo,highlevelCelltype))
+
+filtered_CSawyer_intact_Str <- NormalizeData(filtered_CSawyer_intact_Str, normalization.method = "LogNormalize", scale.factor = 10000)
+filtered_CSawyer_intact_Str <- FindVariableFeatures(filtered_CSawyer_intact_Str, selection.method = "vst", nfeatures = 2000, verbose = T)
+filtered_CSawyer_intact_Str <- ScaleData(filtered_CSawyer_intact_Str,  do.center = FALSE)
+filtered_CSawyer_intact_Str <- RunOptimizeALS(filtered_CSawyer_intact_Str, k = 21, lambda = 5)
+filtered_CSawyer_intact_Str <- RunQuantileNorm(filtered_CSawyer_intact_Str)
+filtered_CSawyer_intact_Str <- FindNeighbors(filtered_CSawyer_intact_Str, reduction = "iNMF_raw", dims = 1:20)
+filtered_CSawyer_intact_Str <- FindClusters(filtered_CSawyer_intact_Str, resolution = c(0.5, 0.8,1,3,5))
+filtered_CSawyer_intact_Str <- RunUMAP(filtered_CSawyer_intact_Str, dims = 1:ncol(filtered_CSawyer_intact_Str[["iNMF_raw"]]), reduction = "iNMF_raw")
+Idents(filtered_CSawyer_intact_Str) <- filtered_CSawyer_intact_Str$RNA_snn_res.0.5
+
+DimPlot(filtered_CSawyer_intact_Str, group.by = "RNA_snn_res.0.5", label = T)
+
+# Check cell type
+# refer to Karthaus et al. Science 2020 (CSawyers) mouse clustering
+# endothelium CD31, Vwf;
+# lymphatic endothelium, CD31, Prox1; 
+# glia, Sox10;
+# myofibroblast, Acta2, Myh11, Rspo3;
+# smooth muscle, Acta2, Notch3;
+# mesenchymal 1, Col5a2, Lama2, Zeb1 Wnt2, Wnt6, Wnt10a, Rorb;
+# mesenschymal 2,Col5a2, Lama2, Zeb1, Sult1e1, Fgf10, Rspo1;
+
+gene_stromal <- c("Pecam1", "Vwf",
+                  "Prox1", "Sox10",
+                  "Acta2", "Myh11", "Rspo3","Notch3",
+                  "Col5a2", "Lama2", "Zeb1", "Wnt2", "Wnt6", "Wnt10a", "Rorb",
+                  "Sult1e1", "Fgf10","Rspo1")
+Idents(filtered_CSawyer_intact_Str) <- filtered_CSawyer_intact_Str$RNA_snn_res.0.5
+AvgExpr <- AverageExpression(filtered_CSawyer_intact_Str, features = gene_stromal)
+AvgExpr <- AvgExpr[[1]]
+AvgExpr <- as.data.frame(AvgExpr)
+AvgExpr <- t(AvgExpr)
+AvgExpr <- round(AvgExpr, 3)
+
+Idents(filtered_CSawyer_intact_Str) <- filtered_CSawyer_intact_Str$RNA_snn_res.0.5
+VlnPlot(filtered_CSawyer_intact_Str, features = gene_stromal, stack = T, flip = T)
+
+Idents(filtered_CSawyer_intact_Str) <- "RNA_snn_res.0.5"
+filtered_CSawyer_intact_Str <-  RenameIdents(object = filtered_CSawyer_intact_Str,
+                                             "0" = "Mesenchymal 1",
+                                             "1" = "Mesenchymal 1",
+                                             "2" = "Mesenchymal 2",
+                                             "3" = "Endothelial",
+                                             "4" = "Endothelial",
+                                             "5" = "Mesenchymal 2",
+                                             "6" = "Myofibroblast/Smooth muscle",
+                                             "7" = "Mesenchymal 2",
+                                             "8" = "Myofibroblast/Smooth muscle",
+                                             "9" = "Lymphatic endothelium",
+                                             "10" = "Glial",
+                                             "11" = "Mesenchymal 1",
+                                             "12" = "Mesenchymal 1",
+                                             "13" = "Myofibroblast/Smooth muscle"
+)
+filtered_CSawyer_intact_Str$stromal_celltype <- Idents(filtered_CSawyer_intact_Str)
+p1 <- DimPlot(filtered_CSawyer_intact_Str, group.by = "RNA_snn_res.0.5", label = T)
+p2 <-DimPlot(filtered_CSawyer_intact_Str, group.by = "stromal_celltype")
+p3 <-DimPlot(filtered_CSawyer_intact_Str, group.by = "predType")
+plot_grid(p1, p2, p3, ncol = 2)
+
+# save(filtered_CSawyer_intact_Str, file = "RData/filtered_CSawyer_intact_Str_XGBoost.RData")
+
+```
+
+#### xgboost for Intact CSawyers (Stromal only) ####
+
+```{r}
+#install.packages("xgboost")
+library(xgboost)
+library(tidymodels)
+
+set.seed(123)
+data<- filtered_CSawyer_intact_Str@assays$RNA@scale.data
+data<- data[rownames(data) %in% gene_stromal,]
+data<- t(data) %>% as.data.frame()
+data$cell_type <- filtered_CSawyer_intact_Str$stromal_celltype
+data$cell_type<- factor(data$cell_type)
+data$cell_barcode<- rownames(data)
+
+data_split <- initial_split(data, strata = "cell_type")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# 10 fold cross validation
+data_fold <- vfold_cv(data_train, v = 10)
+
+bt_recipe <- 
+  recipe(formula = cell_type ~ ., data = data_train) %>%
+  update_role(cell_barcode, new_role = "ID") %>%
+  step_zv(all_predictors())
+
+## feature importance sore to TRUE, tune mtry and number of trees
+bt_spec <- 
+  boost_tree(mtry = tune(), trees = tune()) %>%
+  set_engine("xgboost", importance = TRUE) %>%
+  set_mode("classification")
+
+bt_workflow <- workflow() %>% 
+  add_recipe(bt_recipe) %>% 
+  add_model(bt_spec)
+
+bt_grid<- grid_regular(mtry(range= c(1, 20)), trees(), levels = 3)
+
+# library(doParallel)
+# doParallel::registerDoParallel()
+
+# # save_pred = TRUE for later ROC curve
+tune_res <- tune_grid(
+  bt_workflow,
+  resamples = data_fold, 
+  grid = bt_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+# check which penalty is the best 
+autoplot(tune_res)
+best_penalty <- select_best(tune_res, metric = "accuracy")
+best_penalty
+
+bt_final <- finalize_workflow(bt_workflow, best_penalty)
+bt_final_fit_Stromal <- fit(bt_final, data = data_train)
+
+## confusion matrix, perfect classification! 
+predict(bt_final_fit_Stromal, new_data = data_test) %>%
+  bind_cols(data_test %>% select(cell_type)) %>%
+  conf_mat(truth = cell_type, estimate = .pred_class)
+
+# save(bt_final_fit_Stromal, file = "RData/XGBoost_CSawyer_T00int_Stromal.RData")
+```
+
+#### 3. Load all Karthaus CSawyers (intact and castrate) ####
+
+```{r}
+# load Karthaus CSawyers
+CSawyer 
+# Subset to Intact vs CastD28 only
+Idents(CSawyer) <- CSawyer$sampleType
+CSawyer_subset <- subset(CSawyer, 
+                         idents = c("Intact","Cast") , 
+                         invert = F)
+Idents(CSawyer_subset) <- CSawyer_subset$batchID
+CSawyer_subset <- subset(CSawyer_subset, idents = c("T00_Epi_1","T00_Epi_2",
+                                                    "T00_NonEpi_1", "T00_NonEpi_2", "T00_Unsorted_1",
+                                                    "T01_Cast_Day1_1" , "T01_Cast_Day1_2" , "T02_Cast_Day7_1",  "T02_Cast_Day7_2", 
+                                                    "T03_Cast_Day14_1","T03_Cast_Day14_2"), 
+                         invert = T)
+table(CSawyer_subset$batchID)
+
+# Compute percent mito ratio
+CSawyer_subset$mitoRatio <- PercentageFeatureSet(object = CSawyer_subset, pattern = "^mt-")
+CSawyer_subset$mitoRatio <- CSawyer_subset@meta.data$mitoRatio / 100
+
+# filter
+filtered_CSawyer_subset <- subset(
+  x = CSawyer_subset,
+  subset =  nFeature_RNA > 500 &
+    nCount_RNA > 1000 &
+    mitoRatio < 0.15)
+
+table(filtered_CSawyer_subset$batchID)
+
+# run basic Seurat to get the cluster
+filtered_CSawyer_subset <- NormalizeData(filtered_CSawyer_subset, normalization.method = "LogNormalize", scale.factor = 10000)
+filtered_CSawyer_subset <- FindVariableFeatures(filtered_CSawyer_subset, selection.method = "vst", nfeatures = 2000, verbose = T)
+filtered_CSawyer_subset <- ScaleData(filtered_CSawyer_subset, split.by = "batchID", do.center = FALSE)
+filtered_CSawyer_subset <- RunOptimizeALS(filtered_CSawyer_subset, k = 21, lambda = 5, split.by = "batchID")
+filtered_CSawyer_subset <- RunQuantileNorm(filtered_CSawyer_subset, split.by = "batchID")
+filtered_CSawyer_subset <- FindNeighbors(filtered_CSawyer_subset, reduction = "iNMF_raw", dims = 1:20)
+filtered_CSawyer_subset <- FindClusters(filtered_CSawyer_subset, resolution = c(0.5, 0.8,1,3,5))
+filtered_CSawyer_subset <- RunUMAP(filtered_CSawyer_subset, dims = 1:ncol(filtered_CSawyer_subset[["iNMF_raw"]]), reduction = "iNMF_raw")
+
+## Split by high level lineage
+Idents(filtered_CSawyer_subset) <- filtered_CSawyer_subset$RNA_snn_res.0.8
+AvgExpr <- AverageExpression(filtered_CSawyer_subset, features = c("Epcam","Ptprc"), add.ident = "sampleInfo")
+AvgExpr <- AvgExpr[[1]]
+AvgExpr <- as.data.frame(AvgExpr)
+AvgExpr <- t(AvgExpr)
+
+Idents(filtered_CSawyer_subset) <- "RNA_snn_res.0.8"
+VlnPlot(filtered_CSawyer_subset, features = c("Epcam","Ptprc"), stack = T, flip = T, split.by = "sampleInfo")
+
+filtered_CSawyer_subset <-  RenameIdents(object = filtered_CSawyer_subset,
+                                         "0" = "Epithelial",
+                                         "1" = "Epithelial",
+                                         "2" = "Epithelial",
+                                         "3" = "Epithelial",
+                                         "4" = "Stromal",
+                                         "5" = "Stromal",
+                                         "6" = "Epithelial",
+                                         "7" = "Stromal",
+                                         "8" = "Epithelial",
+                                         "9" = "Immune",
+                                         "10" = "Stromal",
+                                         "11" = "Stromal",
+                                         "12" = "Immune",
+                                         "13" = "Epithelial",
+                                         "14" = "Epithelial",
+                                         "15" = "Immune",
+                                         "16" = "Stromal",
+                                         "17" = "Epithelial",
+                                         "18" = "Stromal",
+                                         "19" = "Immune",
+                                         "20" = "Epithelial",
+                                         "21" = "Stromal",
+                                         "22" = "Immune",
+                                         "23" = "Immune",
+                                         "24" = "Stromal",
+                                         "25" = "Stromal",
+                                         "26" = "Immune"
+                                         
+)
+filtered_CSawyer_subset$highlevelCelltype <- Idents(filtered_CSawyer_subset)
+p1 <- DimPlot(filtered_CSawyer_subset, group.by = "highlevelCelltype", label = F, split.by = "sampleInfo")
+p2 <- DimPlot(filtered_CSawyer_subset, group.by = "highLevelPred", label = F, split.by = "sampleInfo")
+plot_grid(p1,p2, ncol = 1)
+
+# save(filtered_CSawyer_subset, file = "RData/filtered_CSawyer_subset_highlevelCellType.RData")
+```
+
+#### 4a. subset to epithelial clusters only to get classifier ####
+
+```{r}
+Idents(filtered_CSawyer_subset) <- filtered_CSawyer_subset$highlevelCelltype
+filtered_CSawyer_subset_Epi <- subset(filtered_CSawyer_subset, idents = "Epithelial")
+table(filtered_CSawyer_subset_Epi$highlevelCelltype)
+
+# predict via bt_fit
+# load("RData/XGBoost_CSawyer_T00int_Epi_withbasalsubsets_final.RData")
+set.seed(123)
+data_CSawyer <- filtered_CSawyer_subset_Epi@assays$RNA@data
+data_CSawyer <- data_CSawyer[rownames(data_CSawyer) %in% c(gene_epi),]
+data_CSawyer<- t(data_CSawyer) %>% as.data.frame()
+data_CSawyer$RNA_snn_res.1 <- filtered_CSawyer_subset_Epi$RNA_snn_res.1
+data_CSawyer$RNA_snn_res.1 <- factor(data_CSawyer$RNA_snn_res.1)
+data_CSawyer$cell_barcode<- rownames(data_CSawyer)
+# colnames(data_CSawyer)[6] <- "Nkx3-1"
+
+# Check that the column names match
+all(colnames(data_CSawyer) == colnames(bt_final_fit_Epi))
+# Make predictions
+pred_CSawyer_Epi <- predict(bt_final_fit_Epi , new_data = data_CSawyer) %>%
+  bind_cols(data_CSawyer %>% select(RNA_snn_res.1, cell_barcode)) 
+
+filtered_CSawyer_subset_Epi$pred_celltype <- ifelse(colnames(filtered_CSawyer_subset_Epi) %in% pred_CSawyer_Epi$cell_barcode, 
+                                                    as.character(pred_CSawyer_Epi$.pred_class), "NA")
+DimPlot(filtered_CSawyer_subset_Epi, group.by = "pred_celltype", split.by = "sampleInfo")
+DimPlot(filtered_CSawyer_subset_Epi, group.by = "predType", split.by = "sampleInfo")
+
+
+# save(filtered_CSawyer_subset_Epi, file="RData/filtered_CSawyer_subset_Epi_XGBoost.RData")
+
+```
+
+#### 4b. subset to Immune clusters only to get classifier ####
+
+
+```{r}
+
+Idents(filtered_CSawyer_subset) <- filtered_CSawyer_subset$highlevelCelltype
+filtered_CSawyer_subset_Imm <- subset(filtered_CSawyer_subset, idents = "Immune")
+table(filtered_CSawyer_subset_Imm$highlevelCelltype)
+
+# predict via bt_fit
+# load("RData/XGBoost_CSawyer_T00int_Immune.RData")
+set.seed(123)
+data_CSawyer <- filtered_CSawyer_subset_Imm@assays$RNA@data
+data_CSawyer <- data_CSawyer[rownames(data_CSawyer) %in% c(gene_immune),]
+data_CSawyer<- t(data_CSawyer) %>% as.data.frame()
+data_CSawyer$RNA_snn_res.1 <- filtered_CSawyer_subset_Imm$RNA_snn_res.1
+data_CSawyer$RNA_snn_res.1 <- factor(data_CSawyer$RNA_snn_res.1)
+data_CSawyer$cell_barcode<- rownames(data_CSawyer)
+# colnames(data_CSawyer)[6] <- "Nkx3-1"
+
+# Check that the column names match
+all(colnames(data_CSawyer) == colnames(bt_final_fit_Imm))
+# Make predictions
+pred_CSawyer_Epi <- predict(bt_final_fit_Imm , new_data = data_CSawyer) %>%
+  bind_cols(data_CSawyer %>% select(RNA_snn_res.1, cell_barcode)) 
+
+filtered_CSawyer_subset_Imm$pred_celltype <- ifelse(colnames(filtered_CSawyer_subset_Imm) %in% pred_CSawyer_Epi$cell_barcode, 
+                                                    as.character(pred_CSawyer_Epi$.pred_class), "NA")
+
+Idents(filtered_CSawyer_subset_Imm) <- filtered_CSawyer_subset_Imm$pred_celltype
+Marker_filtered_CSwayer_subset_Imm <- FindMarkers(filtered_CSawyer_subset_Imm, only.pos = F, ident.1 = "T04_Cast_Day28",
+                                                  group.by = "sampleInfo", subset.ident = "B cell")
+Marker_filtered_CSwayer_subset_Imm <- Marker_filtered_CSwayer_subset_Imm %>% filter(p_val_adj < 0.05)
+
+# png(filename = "Output/For_ARdel_project/Dimplot_filtered_CSawyer_subset_Imm.# png", width = 1300, height = 1000, res = 200)
+DimPlot(filtered_CSawyer_subset_Imm, group.by = "pred_celltype", split.by = "sampleInfo")
+# dev.off()
+
+# save(filtered_CSawyer_subset_Imm, file="RData/filtered_CSawyer_subset_Imm_XGBoost.RData")
+```
+
+#### 4c. subset to Stromal clusters only to get classifier ####
+
+```{r}
+Idents(filtered_CSawyer_subset) <- filtered_CSawyer_subset$highlevelCelltype
+filtered_CSawyer_subset_Str <- subset(filtered_CSawyer_subset, idents = "Stromal")
+table(filtered_CSawyer_subset_Str$highlevelCelltype)
+
+# predict via bt_fit
+# load("RData/XGBoost_CSawyer_T00int_Stromal.RData")
+set.seed(123)
+data_CSawyer <- filtered_CSawyer_subset_Str@assays$RNA@data
+data_CSawyer <- data_CSawyer[rownames(data_CSawyer) %in% c(gene_stromal),]
+data_CSawyer<- t(data_CSawyer) %>% as.data.frame()
+data_CSawyer$RNA_snn_res.1 <- filtered_CSawyer_subset_Str$RNA_snn_res.1
+data_CSawyer$RNA_snn_res.1 <- factor(data_CSawyer$RNA_snn_res.1)
+data_CSawyer$cell_barcode<- rownames(data_CSawyer)
+# colnames(data_CSawyer)[6] <- "Nkx3-1"
+
+# Check that the column names match
+all(colnames(data_CSawyer) == colnames(bt_final_fit_Stromal))
+# Make predictions
+pred_CSawyer_Epi <- predict(bt_final_fit_Stromal , new_data = data_CSawyer) %>%
+  bind_cols(data_CSawyer %>% select(RNA_snn_res.1, cell_barcode)) 
+
+filtered_CSawyer_subset_Str$pred_celltype <- ifelse(colnames(filtered_CSawyer_subset_Str) %in% pred_CSawyer_Epi$cell_barcode, 
+                                                    as.character(pred_CSawyer_Epi$.pred_class), "NA")
+
+# png(filename = "Output/For_ARdel_project/Dimplot_filtered_CSawyer_subset_Str.# png", width = 1300, height = 1000, res = 200)
+DimPlot(filtered_CSawyer_subset_Str, group.by = "pred_celltype", split.by = "sampleInfo")
+# dev.off()
+
+# save(filtered_CSawyer_subset_Str, file="RData/filtered_CSawyer_subset_Str_XGBoost.RData")
+
+```
